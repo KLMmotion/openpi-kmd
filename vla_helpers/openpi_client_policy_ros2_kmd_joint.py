@@ -19,7 +19,7 @@ try:
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import CompressedImage
 except ImportError as exc:
-    print("需要 ROS2 Python: rclpy, sensor_msgs", file=sys.stderr)
+    print("ROS2 Python packages required: rclpy, sensor_msgs", file=sys.stderr)
     raise SystemExit(1) from exc
 
 from openpi_policy_shared import (
@@ -120,13 +120,13 @@ class RosQuadTileReceiver(Node):
         self.frame_lock = threading.Lock()
         self.latest_frames = {k: None for k in _CAMERA_KEYS}
         self.create_subscription(CompressedImage, topic, self._on_compressed, QOS_SENSOR)
-        self.get_logger().info(f"订阅 CompressedImage: {topic} (KMD 三相机切分)")
+        self.get_logger().info(f"Subscribed to CompressedImage: {topic} (KMD 3-camera split)")
 
     def _on_compressed(self, msg: CompressedImage) -> None:
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if img is None:
-            self.get_logger().warning("压缩图解码失败")
+            self.get_logger().warning("Failed to decode compressed image")
             return
         tiles = split_quad_bgr_3cam(img)
         with self.frame_lock:
@@ -169,7 +169,7 @@ def parse_args():
         "--ws-joints-in-radians",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="机器人 WebSocket 上报/接收关节角默认按弧度处理",
+        help="Assume the robot WebSocket publishes and accepts joint angles in radians",
     )
     p.add_argument("--crop-left", type=float, default=0.0)
     p.add_argument("--crop-right", type=float, default=0.0)
@@ -225,7 +225,7 @@ def main():
         )
         print(f"✅ Policy: {args.policy_host}:{args.policy_port}")
     else:
-        print("⚠️ openpi_client 不可用")
+        print("⚠️ openpi_client is not available")
 
     grip_fb: dict[str, float] = {"left": 0.0, "right": 0.0}
     action_plan: collections.deque = collections.deque()
