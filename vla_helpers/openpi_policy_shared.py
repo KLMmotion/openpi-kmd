@@ -4,14 +4,14 @@ Shared helpers for KMD real-robot policy clients.
 
 from __future__ import annotations
 
-import asyncio
-import collections
-import json
+import base64
 import threading
 import time
+from typing import Any
 
 import cv2
 import numpy as np
+import requests
 
 try:
     from openpi_client import websocket_client_policy  # noqa: F401
@@ -22,6 +22,7 @@ except ImportError:
 
 IMG_SIZE = 256
 DEFAULT_TASK_INSTRUCTION = "Pick up the target object and place it at the target position"
+_CAMERA_KEYS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
 def ensure_hwc_uint8(img):
@@ -59,102 +60,75 @@ def crop_by_ratio(img, crop_left, crop_right, crop_top, crop_bottom):
     return img[y0:y1, x0:x1]
 
 
-class WSJointStateClient:
-    def __init__(self, uri: str, reconnect_sec: float = 1.0, send_rate_hz: float = 10.0):
-        self.uri = uri
-        self.reconnect_sec = reconnect_sec
-        self.send_rate_hz = max(0.1, float(send_rate_hz))
-        self._latest_joint_state = None
-        self._pending_actions = collections.deque()
-        self._last_send_ts = 0.0
+def decode_quad_image(quad_image: dict[str, Any] | None) -> bytes | None:
+    if not quad_image or "data" not in quad_image:
+        return None
+    return base64.b64decode(quad_image["data"])
+
+
+def split_quad_bgr_3cam(img_bgr: np.ndarray) -> dict[str, np.ndarray]:
+    """Split a 2x2 quad-tile image into the 3 cameras used by KMD checkpoints."""
+    h, w = img_bgr.shape[:2]
+    sub_h, sub_w = h // 2, w // 2
+    return {
+        "cam_high": img_bgr[sub_h:h, sub_w:w].copy(),
+        "cam_left_wrist": img_bgr[0:sub_h, sub_w:w].copy(),
+        "cam_right_wrist": img_bgr[sub_h:h, 0:sub_w].copy(),
+    }
+
+
+def quad_image_dict_to_cameras(quad_image: dict[str, Any] | None) -> dict[str, np.ndarray | None]:
+    image_bytes = decode_quad_image(quad_image)
+    if image_bytes is None:
+        return {k: None for k in _CAMERA_KEYS}
+    buf = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        return {k: None for k in _CAMERA_KEYS}
+    return split_quad_bgr_3cam(img)
+
+
+class VlaHostClient:
+    """HTTP client for the vlahost server (GET /state, POST /action)."""
+
+    def __init__(self, server_url: str, timeout_sec: float = 0.5):
+        base = server_url.rstrip("/")
+        self.state_url = f"{base}/state"
+        self.action_url = f"{base}/action"
+        self.timeout_sec = timeout_sec
         self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread = None
+        self._latest_state: dict[str, Any] | None = None
 
-    def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-
-    def get_latest_joint_state(self):
+    def fetch_state(self) -> dict[str, Any]:
+        resp = requests.get(self.state_url, timeout=self.timeout_sec)
+        resp.raise_for_status()
+        state = resp.json()
         with self._lock:
-            return self._latest_joint_state
+            self._latest_state = state
+        return state
 
-    def update_joint_action(self, joint_actions):
+    def get_latest_joint_state(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self._latest_state is None:
+                return None
+            return self._extract_joint_state(self._latest_state)
+
+    def post_joint_action(self, joint_actions: np.ndarray | list[float]) -> dict[str, Any]:
         arr = np.asarray(joint_actions, dtype=np.float64).flatten()
-        payload = {
-            "type": "action",
-            "stamp_ns": time.time_ns(),
-            "joint_actions": [float(x) for x in arr],
-        }
-        with self._lock:
-            self._pending_actions.append(payload)
-
-    def _run(self):
-        try:
-            asyncio.run(self._run_async())
-        except Exception as exc:
-            print(f"❌ [ws] Error: {exc}")
-
-    async def _run_async(self):
-        try:
-            import websockets
-        except Exception as exc:
-            print(f"⚠️ [ws] websockets import failed: {exc}")
-            return
-
-        while not self._stop_event.is_set():
-            try:
-                async with websockets.connect(self.uri) as ws:
-                    print(f"✅ [ws] Connected to {self.uri}")
-                    while not self._stop_event.is_set():
-                        now = time.time()
-                        if (now - self._last_send_ts) >= (1.0 / self.send_rate_hz):
-                            with self._lock:
-                                action_payload = self._pending_actions.popleft() if self._pending_actions else None
-                            if action_payload is not None:
-                                await ws.send(json.dumps(action_payload))
-                                self._last_send_ts = now
-
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=0.02)
-                        except asyncio.TimeoutError:
-                            continue
-
-                        payload = self._try_parse_json(msg)
-                        if payload is None:
-                            continue
-                        js = self._extract_joint_state(payload)
-                        if js is not None:
-                            with self._lock:
-                                self._latest_joint_state = js
-            except Exception as exc:
-                if not self._stop_event.is_set():
-                    print(f"⚠️ [ws] Reconnecting: {exc}")
-                    await asyncio.sleep(self.reconnect_sec)
+        payload = {"joint_actions": [float(x) for x in arr]}
+        resp = requests.post(self.action_url, json=payload, timeout=self.timeout_sec)
+        resp.raise_for_status()
+        return resp.json()
 
     @staticmethod
-    def _try_parse_json(msg):
-        try:
-            return json.loads(msg)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _extract_joint_state(payload):
-        if not isinstance(payload, dict):
-            return None
-        candidate = payload.get("joint_states", payload)
+    def _extract_joint_state(state: dict[str, Any]) -> dict[str, Any] | None:
+        candidate = state.get("joint_states")
         if not isinstance(candidate, dict):
             return None
-        raw_pos = candidate.get("position", candidate.get("positions", []))
+        raw_pos = candidate.get("positions", candidate.get("position", []))
         if not isinstance(raw_pos, list) or len(raw_pos) == 0:
             return None
-        result = {"position": [float(x) for x in raw_pos]}
+        result: dict[str, Any] = {"position": [float(x) for x in raw_pos]}
 
         def _opt_float(d: dict, key: str):
             if key not in d or d[key] is None:
@@ -166,8 +140,6 @@ class WSJointStateClient:
 
         for gkey in ("gripper_left", "gripper_right"):
             v = _opt_float(candidate, gkey)
-            if v is None and candidate is not payload:
-                v = _opt_float(payload, gkey)
             if v is not None:
                 result[gkey] = v
         return result

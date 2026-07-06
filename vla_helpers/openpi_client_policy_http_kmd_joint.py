@@ -4,41 +4,25 @@ from __future__ import annotations
 
 import argparse
 import collections
-import sys
-import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-
-try:
-    import rclpy
-    from rclpy.executors import MultiThreadedExecutor
-    from rclpy.node import Node
-    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import CompressedImage
-except ImportError as exc:
-    print("ROS2 Python packages required: rclpy, sensor_msgs", file=sys.stderr)
-    raise SystemExit(1) from exc
+import requests
 
 from openpi_policy_shared import (
     DEFAULT_TASK_INSTRUCTION,
     IMG_SIZE,
     POLICY_CLIENT_AVAILABLE,
-    WSJointStateClient,
+    VlaHostClient,
     crop_by_ratio,
     ensure_hwc_uint8,
+    quad_image_dict_to_cameras,
 )
 
 if POLICY_CLIENT_AVAILABLE:
     from openpi_client import websocket_client_policy
-
-QOS_SENSOR = QoSProfile(
-    depth=10,
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    history=HistoryPolicy.KEEP_LAST,
-)
 
 _CAMERA_KEYS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 _JOINT_LEFT_SLICE = slice(0, 7)
@@ -58,16 +42,6 @@ def action_model_deg_to_ws_rad(action: np.ndarray) -> np.ndarray:
     out[_JOINT_LEFT_SLICE] = np.deg2rad(out[_JOINT_LEFT_SLICE])
     out[_JOINT_RIGHT_SLICE] = np.deg2rad(out[_JOINT_RIGHT_SLICE])
     return out
-
-
-def split_quad_bgr_3cam(img_bgr: np.ndarray) -> dict[str, np.ndarray]:
-    h, w = img_bgr.shape[:2]
-    sub_h, sub_w = h // 2, w // 2
-    return {
-        "cam_high": img_bgr[sub_h:h, sub_w:w].copy(),
-        "cam_left_wrist": img_bgr[0:sub_h, sub_w:w].copy(),
-        "cam_right_wrist": img_bgr[sub_h:h, 0:sub_w].copy(),
-    }
 
 
 def build_state_vector(
@@ -114,47 +88,13 @@ def build_state_vector(
     return out
 
 
-class RosQuadTileReceiver(Node):
-    def __init__(self, topic: str):
-        super().__init__("openpi_policy_ros2_kmd_joint")
-        self.frame_lock = threading.Lock()
-        self.latest_frames = {k: None for k in _CAMERA_KEYS}
-        self.create_subscription(CompressedImage, topic, self._on_compressed, QOS_SENSOR)
-        self.get_logger().info(f"Subscribed to CompressedImage: {topic} (KMD 3-camera split)")
-
-    def _on_compressed(self, msg: CompressedImage) -> None:
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if img is None:
-            self.get_logger().warning("Failed to decode compressed image")
-            return
-        tiles = split_quad_bgr_3cam(img)
-        with self.frame_lock:
-            for key, arr in tiles.items():
-                self.latest_frames[key] = arr
-
-
-def start_ros_executor_in_thread(executor: MultiThreadedExecutor) -> threading.Thread:
-    def _run():
-        try:
-            executor.spin()
-        except Exception as exc:
-            print(f"❌ [ros2 executor] {exc}")
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    return thread
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="OpenPI ROS2 client for KMD 16D joint-space checkpoints")
-    p.add_argument("--topic", default="/quad_tile/compressed")
-    p.add_argument("--ws-host", default="192.168.15.123")
-    p.add_argument("--ws-port", type=int, default=8765)
+    p = argparse.ArgumentParser(description="OpenPI HTTP client for KMD 16D joint-space checkpoints")
+    p.add_argument("--robot-server-url", default="http://127.0.0.1:8000", help="vlahost server base URL on the robot")
+    p.add_argument("--robot-timeout-sec", type=float, default=0.5, help="HTTP timeout for /state and /action")
     p.add_argument("--policy-host", default="localhost")
     p.add_argument("--policy-port", type=int, default=8000)
-    p.add_argument("--disable-ws", action="store_true")
-    p.add_argument("--ws-send-rate", type=float, default=10.0)
+    p.add_argument("--disable-action-post", action="store_true", help="Inference only, do not POST actions to the robot")
     p.add_argument("--task-prompt", type=str, default=DEFAULT_TASK_INSTRUCTION)
     p.add_argument("--replan-steps", type=int, default=6)
     p.add_argument("--action-rate", type=float, default=20.0)
@@ -166,10 +106,10 @@ def parse_args():
     p.add_argument("--arm-joints-left", type=int, default=7)
     p.add_argument("--arm-joints-right", type=int, default=7)
     p.add_argument(
-        "--ws-joints-in-radians",
+        "--joints-in-radians",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Assume the robot WebSocket publishes and accepts joint angles in radians",
+        help="Assume vlahost joint_states.positions and POST /action joint_actions use radians",
     )
     p.add_argument("--crop-left", type=float, default=0.0)
     p.add_argument("--crop-right", type=float, default=0.0)
@@ -199,23 +139,14 @@ def make_preview_canvas(images: dict[str, np.ndarray], state_vec: np.ndarray) ->
 
 def main():
     args = parse_args()
-    if args.ws_joints_in_radians:
-        print("🔄 [units] WS joint_states rad -> model deg -> WS joint_actions rad")
-
-    rclpy.init()
-    receiver = RosQuadTileReceiver(args.topic)
-    executor = MultiThreadedExecutor()
-    executor.add_node(receiver)
-    start_ros_executor_in_thread(executor)
+    if args.joints_in_radians:
+        print("🔄 [units] vlahost joint_states rad -> model deg -> POST joint_actions rad")
 
     dump_session_dir = Path(__file__).resolve().parent / "obs_dumps" / time.strftime("%Y%m%d_%H%M%S")
     dump_session_dir.mkdir(parents=True, exist_ok=True)
 
-    ws_client = None
-    if not args.disable_ws:
-        ws_client = WSJointStateClient(f"ws://{args.ws_host}:{args.ws_port}", send_rate_hz=args.ws_send_rate)
-        ws_client.start()
-        print(f"✅ WebSocket: ws://{args.ws_host}:{args.ws_port}")
+    robot_client = VlaHostClient(args.robot_server_url, timeout_sec=args.robot_timeout_sec)
+    print(f"✅ vlahost: {args.robot_server_url}")
 
     policy_client = None
     if POLICY_CLIENT_AVAILABLE:
@@ -261,10 +192,7 @@ def main():
             print(f"⚠️ [cv2.imshow] disabled: {exc}")
             cv_show_state["enabled"] = False
 
-    def get_latest_observation_inputs():
-        with receiver.frame_lock:
-            frames = {k: receiver.latest_frames.get(k) for k in _CAMERA_KEYS}
-
+    def process_camera_frames(raw_frames: dict[str, np.ndarray | None]) -> dict[str, np.ndarray]:
         def _head(im):
             if im is None or not isinstance(im, np.ndarray) or im.size == 0:
                 return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
@@ -283,16 +211,19 @@ def main():
             )
             return ensure_hwc_uint8(cropped)
 
-        cam_high = _head(frames.get("cam_high"))
-        cam_left = _wrist(frames.get("cam_left_wrist"), cam_high)
-        cam_right = _wrist(frames.get("cam_right_wrist"), cam_high)
-        images = {
+        cam_high = _head(raw_frames.get("cam_high"))
+        cam_left = _wrist(raw_frames.get("cam_left_wrist"), cam_high)
+        cam_right = _wrist(raw_frames.get("cam_right_wrist"), cam_high)
+        return {
             "cam_high": cam_high,
             "cam_left_wrist": cam_left,
             "cam_right_wrist": cam_right,
         }
 
-        js = ws_client.get_latest_joint_state() if ws_client else None
+    def observation_from_state(state_payload: dict) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        raw_frames = quad_image_dict_to_cameras(state_payload.get("quad_image"))
+        images = process_camera_frames(raw_frames)
+        js = VlaHostClient._extract_joint_state(state_payload)
         state = build_state_vector(
             js,
             state_dim=args.state_dim,
@@ -301,18 +232,29 @@ def main():
             arm_joints_right=args.arm_joints_right,
             gripper_fallback=grip_fb,
         )
-        if args.ws_joints_in_radians:
+        if args.joints_in_radians:
             state = state_ws_to_model_deg(state)
         return images, state
 
     try:
         while True:
-            images, state_vec = get_latest_observation_inputs()
+            try:
+                state_payload = robot_client.fetch_state()
+            except requests.RequestException as exc:
+                print(f"⚠️ [vlahost] failed to fetch /state: {exc}")
+                time.sleep(1.0 / max(0.1, args.action_rate))
+                continue
+
+            images, state_vec = observation_from_state(state_payload)
 
             if policy_client is not None and not action_plan:
                 if wait_before_replan and args.replan_wait_sec > 0:
                     time.sleep(args.replan_wait_sec)
-                    images, state_vec = get_latest_observation_inputs()
+                    try:
+                        state_payload = robot_client.fetch_state()
+                        images, state_vec = observation_from_state(state_payload)
+                    except requests.RequestException as exc:
+                        print(f"⚠️ [vlahost] replan fetch failed: {exc}")
                     wait_before_replan = False
 
                 observation = {"images": images, "state": state_vec, "prompt": args.task_prompt}
@@ -354,27 +296,24 @@ def main():
 
                     traceback.print_exc()
 
-            if action_plan and ws_client is not None:
+            if action_plan and not args.disable_action_post:
                 q_model = action_plan.popleft()
                 grip_fb["left"] = float(q_model[_GRIP_INDICES[0]])
                 grip_fb["right"] = float(q_model[_GRIP_INDICES[1]])
-                q_ws = action_model_deg_to_ws_rad(q_model) if args.ws_joints_in_radians else q_model
-                ws_client.update_joint_action(q_ws)
-                if args.print_output:
-                    qvals = ", ".join(f"{float(x):.4f}" for x in np.asarray(q_ws).flatten())
-                    print(f"📡 joint_actions => [{qvals}] | remaining={len(action_plan)}")
+                q_robot = action_model_deg_to_ws_rad(q_model) if args.joints_in_radians else q_model
+                try:
+                    robot_client.post_joint_action(q_robot)
+                    if args.print_output:
+                        qvals = ", ".join(f"{float(x):.4f}" for x in np.asarray(q_robot).flatten())
+                        print(f"📡 POST /action joint_actions => [{qvals}] | remaining={len(action_plan)}")
+                except requests.RequestException as exc:
+                    print(f"⚠️ [vlahost] failed to POST /action: {exc}")
 
             time.sleep(1.0 / max(0.1, args.action_rate))
 
     except KeyboardInterrupt:
         print("\n🛑 shutdown")
     finally:
-        if ws_client is not None:
-            ws_client.stop()
-        executor.shutdown()
-        receiver.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
         cv2.destroyAllWindows()
 
 
