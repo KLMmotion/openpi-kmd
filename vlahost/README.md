@@ -2,13 +2,15 @@
 
 HTTP bridge between the robot (joint feedback, end-effector poses, quad camera) and a remote VLA inference client (e.g. pi0).
 
+Repository: https://github.com/continuity3/vlahost
+
 ```
 robot (local, with ROS)                    pi0 / GPU machine (no ROS)
 ┌───────────────────────┐  GET /state      ┌──────────────────────┐
-│ vlahost_server        │ ◀─────────────── │ openpi HTTP client    │
+│ vlahost_server        │ ◀─────────────── │ VLA inference client  │
 │ - /info/joint_feedback│  state+image     │ - no rclpy dependency │
-│ - /info/eef_left/right│ ───────────────▶ │ - calls OpenPI policy │
-│ - quad_tile/compressed│                  │   over WebSocket      │
+│ - /info/eef_left/right│ ───────────────▶ │ - polls /state        │
+│ - quad_tile/compressed│                  │ - POSTs /action        │
 │ - publishes control/* │  POST /action    │                       │
 │                       │ ◀─────────────── │                       │
 └───────────────────────┘  action(json)     └──────────────────────┘
@@ -30,11 +32,11 @@ Exposes via FastAPI:
   `/control/target_poseR_model`, `control/gripperValueL/R`, `control/eef_constraint`
 - `GET /health`
 
-Build and run from this repository:
+Build and run:
 
 ```bash
-# Link vlahost into your ROS 2 workspace, then build
-ln -s /path/to/openpi-kmd/vlahost ~/ros_ws/src/vlahost
+git clone https://github.com/continuity3/vlahost.git
+ln -s /path/to/vlahost ~/ros_ws/src/vlahost
 cd ~/ros_ws
 colcon build --packages-select vlahost
 source install/setup.bash
@@ -43,17 +45,18 @@ ros2 launch vlahost vlahost_server.launch.py host:=0.0.0.0 port:=8000
 
 ## client (reference stub, no ROS)
 
-The production OpenPI client for KMD joint checkpoints lives at
-[`vla_helpers/openpi_client_policy_http_kmd_joint.py`](../vla_helpers/openpi_client_policy_http_kmd_joint.py).
-
 `vlahost/client.py` is a minimal reference loop that polls `/state` and posts a no-op
 action. Use it only for quick connectivity checks:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r vlahost/client_requirements.txt
-python3 vlahost/vlahost/client.py --server-url http://<robot-host>:8000
+pip install -r client_requirements.txt
+python3 vlahost/client.py --server-url http://<robot-host>:8000
 ```
+
+For OpenPI KMD joint-space deployment, use
+[`vla_helpers/openpi_client_policy_http_kmd_joint.py`](../vla_helpers/openpi_client_policy_http_kmd_joint.py)
+in the parent [openpi-kmd](https://github.com/KLMmotion/openpi-kmd) repository.
 
 ## API format
 

@@ -7,7 +7,7 @@ The supported KMD setup in this repo is:
 - 3 camera inputs: `cam_high`, `cam_left_wrist`, `cam_right_wrist`
 - 16D joint state: `[left_7_joints, left_gripper, right_7_joints, right_gripper]`
 - 16D joint action with the same layout
-- [vlahost](vlahost/README.md) HTTP server on the robot (`GET /state`, `POST /action`)
+- [vlahost](https://github.com/continuity3/vlahost) HTTP server on the robot (`GET /state`, `POST /action`)
 - OpenPI policy WebSocket server on the GPU machine
 
 ## Files Added for KMD
@@ -17,7 +17,7 @@ The customer only needs these files:
 - `scripts/serve_policy_kmd_joint.py`
 - `vla_helpers/openpi_client_policy_http_kmd_joint.py`
 - `vla_helpers/openpi_policy_shared.py`
-- `vlahost/` — robot-side HTTP bridge (see [vlahost/README.md](vlahost/README.md))
+- `src/openpi/policies/aloha7_policy.py`
 
 ## What You Need Before Running
 
@@ -25,7 +25,7 @@ You need all of the following:
 
 1. A trained checkpoint directory containing `model.safetensors`
 2. A checkpoint `assets/<asset_id>/norm_stats.json`
-3. [vlahost](vlahost/README.md) server running on the robot and exposing `GET /state` and `POST /action`
+3. [vlahost](https://github.com/continuity3/vlahost) server running on the robot and exposing `GET /state` and `POST /action`
 4. OpenPI policy server running on the GPU machine
 
 Typical checkpoint example:
@@ -84,17 +84,18 @@ cd /home/wyz/openpi-vla-kmd/openpi-kmd
 uv sync
 ```
 
-On the robot machine, link and build vlahost from this repository (requires ROS 2):
+On the robot machine, clone and build vlahost (requires ROS 2):
 
 ```bash
-ln -s /path/to/openpi-kmd/vlahost ~/ros_ws/src/vlahost
+git clone https://github.com/continuity3/vlahost.git
+ln -s /path/to/vlahost ~/ros_ws/src/vlahost
 cd ~/ros_ws
 colcon build --packages-select vlahost
 source install/setup.bash
 ros2 launch vlahost vlahost_server.launch.py host:=0.0.0.0 port:=8000
 ```
 
-See [vlahost/README.md](vlahost/README.md) for full server details.
+See [vlahost](https://github.com/continuity3/vlahost) for full server details.
 
 The inference client runs on the GPU machine and does **not** require ROS 2.
 
@@ -157,7 +158,7 @@ uv run python vla_helpers/openpi_client_policy_http_kmd_joint.py \
 1. Confirm the checkpoint path is correct
 2. Confirm `model.safetensors` exists
 3. Confirm checkpoint assets include `norm_stats.json`
-4. Start [vlahost](vlahost/README.md) on the robot (`ros2 launch vlahost vlahost_server.launch.py`)
+4. Start [vlahost](https://github.com/continuity3/vlahost) on the robot (`ros2 launch vlahost vlahost_server.launch.py`)
 5. Confirm `GET http://<ROBOT_HOST>:8000/health` returns OK
 6. Start `scripts/serve_policy_kmd_joint.py` on the GPU machine
 7. Start `vla_helpers/openpi_client_policy_http_kmd_joint.py`
