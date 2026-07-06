@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vlahost Debug Panel</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1c25;
+    --surface2: #23263a;
+    --accent: #6c8cff;
+    --success: #4ade80;
+    --warn: #facc15;
+    --text: #e4e6f0;
+    --text2: #888ca6;
+    --radius: 12px;
+    --shadow: 0 4px 24px rgba(0,0,0,.4);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 400 14px/1.6 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 24px; min-height: 100vh; }
+  .app { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+
+  .header { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--surface2); }
+  .header h1 { font-size: 20px; font-weight: 600; letter-spacing: -.02em; }
+  .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 500; background: var(--surface2); }
+  .status-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.green { background: var(--success); box-shadow: 0 0 8px var(--success); }
+  .dot.yellow { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .dot.gray { background: var(--text2); }
+
+  .card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .card-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; background: var(--surface2); font-weight: 500; font-size: 15px; }
+  .card-body { padding: 20px; }
+
+  .cam-card { grid-column: 1 / -1; }
+  .cam-view { position: relative; background: #080a10; min-height: 200px; display: flex; align-items: center; justify-content: center; }
+  .cam-view img { display: block; width: 100%; height: auto; max-height: 480px; object-fit: contain; }
+  .cam-placeholder { color: var(--text2); font-size: 15px; }
+
+  pre.json { background: #0d0f17; padding: 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; white-space: pre-wrap; word-break: break-all; }
+  .json .key { color: #93c5fd; }
+  .json .str { color: #bbf7d0; }
+  .json .num { color: #fde68a; }
+  .json .null { color: #888ca6; font-style: italic; }
+  .json .bool { color: #c4b5fd; }
+
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group label { font-size: 12px; font-weight: 500; color: var(--text2); text-transform: uppercase; letter-spacing: .04em; }
+  .form-group input, .form-group button { border: 1px solid var(--surface2); border-radius: 8px; padding: 10px 14px; background: var(--bg); color: var(--text); font-size: 14px; outline: none; transition: border .15s; }
+  .form-group input:focus { border-color: var(--accent); }
+  .form-group input::placeholder { color: var(--text2); font-size: 12px; }
+  .form-group button {
+    background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; border: none;
+    padding: 11px 18px; border-radius: 8px; transition: opacity .15s;
+  }
+  .form-group button:hover { opacity: .85; }
+  .form-group button:active { opacity: .7; }
+  .full-width { grid-column: 1 / -1; }
+
+  .action-result { margin-top: 16px; }
+  .action-result:empty { display: none; }
+
+  .gripper-row { display: flex; gap: 16px; }
+  .gripper-row .form-group { flex: 1; }
+
+  @media (max-width: 800px) {
+    .app { grid-template-columns: 1fr; }
+    .form-grid { grid-template-columns: 1fr; }
+    .full-width { grid-column: 1; }
+    .cam-view img { max-height: 260px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>vlahost Debug Panel</h1>
+    <span class="status-badge"><span class="dot" id="statusDot"></span><span id="statusLabel">Connecting…</span></span>
+  </div>
+
+  <div class="card cam-card">
+    <div class="card-header">📷 Quad Camera Composite</div>
+    <div class="cam-view" id="camView">
+      <span class="cam-placeholder" id="camPlaceholder">Waiting for image data…</span>
+      <img id="camImage" style="display:none" alt="quadcam composite">
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">📊 Latest State</div>
+    <div class="card-body">
+      <div id="timestamp" style="font-size:12px;color:var(--text2);margin-bottom:12px;"></div>
+      <pre class="json" id="stateDisplay"><span class="null">Waiting for data…</span></pre>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">🎮 Send Test Action</div>
+    <div class="card-body">
+      <form id="actionForm" autocomplete="off">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Left EEF (x y z rx ry rz)</label>
+            <input name="eef_left" placeholder="leave empty to skip" value="">
+          </div>
+          <div class="form-group">
+            <label>Right EEF (x y z rx ry rz)</label>
+            <input name="eef_right" placeholder="leave empty to skip" value="">
+          </div>
+          <div class="gripper-row full-width">
+            <div class="form-group">
+              <label>Left Gripper</label>
+              <input name="gripper_left" type="number" step="0.01" placeholder="leave empty to skip">
+            </div>
+            <div class="form-group">
+              <label>Right Gripper</label>
+              <input name="gripper_right" type="number" step="0.01" placeholder="leave empty to skip">
+            </div>
+          </div>
+          <div class="form-group full-width">
+            <button type="submit">🚀 Send Action</button>
+          </div>
+        </div>
+      </form>
+      <pre class="json action-result" id="actionResult"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+function qs(id) { return document.getElementById(id); }
+
+function highlightJSON(obj) {
+  const json = JSON.stringify(obj, null, 2);
+  return json.replace(/("(?:\\.|[^"\\])*")\s*:/g, '<span class="key">$1</span>:')
+             .replace(/:(\s*)("(?:\\.|[^"\\])*")/g, ':<span class="str">$1$2</span>')
+             .replace(/:\s*(\d+\.?\d*)/g, ':<span class="num">$1</span>')
+             .replace(/:\s*(null)/g, ':<span class="null">$1</span>')
+             .replace(/:\s*(true|false)/g, ':<span class="bool">$1</span>');
+}
+
+function parseVec6(text) {
+  if (!text || !text.trim()) return null;
+  const parts = text.trim().split(/\s+/).map(Number);
+  if (parts.length !== 6 || parts.some(isNaN))
+    throw new Error("Expected 6 numbers, got: \"" + text + "\"");
+  return parts;
+}
+
+async function refreshState() {
+  try {
+    const resp = await fetch("/state");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const state = await resp.json();
+
+    qs("statusLabel").textContent = "Connected";
+    qs("statusDot").className = "dot green";
+
+    if (state.stamp) {
+      const ms = (state.stamp / 1e6).toFixed(0);
+      qs("timestamp").textContent = "stamp: " + new Date(+ms).toLocaleTimeString() + "  (" + state.stamp + " ns)";
+    }
+
+    const quad = state.quad_image;
+    if (quad && quad.data) {
+      qs("camImage").src = "data:image/" + quad.format + ";base64," + quad.data;
+      qs("camImage").style.display = "block";
+      qs("camPlaceholder").style.display = "none";
+    }
+
+    const display = { ...state };
+    if (display.quad_image)
+      display.quad_image = "[jpeg " + (quad?.data?.length || 0) + " bytes]";
+    qs("stateDisplay").innerHTML = highlightJSON(display);
+  } catch (err) {
+    qs("statusLabel").textContent = "Connection error";
+    qs("statusDot").className = "dot yellow";
+    qs("stateDisplay").innerHTML = `<span class="null">${err}</span>`;
+  }
+}
+
+qs("actionForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const el = qs("actionResult");
+  const form = new FormData(ev.target);
+  try {
+    const action = {
+      eef_left: parseVec6(form.get("eef_left")),
+      eef_right: parseVec6(form.get("eef_right")),
+      gripper_left: form.get("gripper_left") ? Number(form.get("gripper_left")) : null,
+      gripper_right: form.get("gripper_right") ? Number(form.get("gripper_right")) : null,
+    };
+    const resp = await fetch("/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action),
+    });
+    const data = await resp.json();
+    el.innerHTML = highlightJSON(data);
+  } catch (err) {
+    el.textContent = "Error: " + err;
+  }
+});
+
+refreshState();
+setInterval(refreshState, 800);
+</script>
+</body>
+</html>
